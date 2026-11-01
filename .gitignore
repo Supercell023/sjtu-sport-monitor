@@ -1,0 +1,6 @@
+# reverse-engineering scratch space (site's own bundled JS - not ours to publish)
+recon/
+# OS / editor noise
+.DS_Store
+*.log
+node_modules/
