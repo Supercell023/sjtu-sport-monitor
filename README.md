@@ -30,6 +30,7 @@ The booking request also matters. `ConfirmOrder` takes an AES-encrypted body plu
 - **Auto-open the payment page** after booking, and remind you again at the 5- and 10-minute marks.
 - **Stops itself** once every target has been booked.
 - **Survives a page refresh** — monitoring resumes automatically.
+- **12:00 release sniping** — clock-synced burst polling that books the newly released day the moment a slot appears.
 - **Backs off politely** — jittered interval, 90 s default, and it never hammers the API.
 
 ---
@@ -52,6 +53,23 @@ Open the panel with the 🎯 button, then:
 2. **Add target**. Repeat for every combination you want watched.
 3. Choose the mode and the polling interval.
 4. **Start**. "试跑一次" (dry run) checks once and reports what it finds without booking.
+
+---
+
+## Sniping the 12:00 release
+
+New slots go on sale at **12:00 sharp every day**, for the day seven days ahead — and they vanish within seconds. Tick **⏰ 12:00 放号抢单** and the script takes over:
+
+1. **Syncs its clock** against the server's `Date` header. That header only has one-second granularity, so the script takes the midpoint of the possible range, samples three times and keeps the fastest round trip — expect ±0.5 s accuracy.
+2. **Wakes up early** (1.5 s by default) and polls the newest date in the list every ~400 ms until a free slot appears or the window closes (25 s by default).
+3. **Books the first free slot immediately** — no grace period in this mode — then opens the payment page and pushes the link to your phone.
+
+Time slots come from the targets you already configured; the date is picked automatically (whatever day is newest in the list — that is the one being released).
+
+Two things worth knowing:
+
+- **Keep the tab visible at 12:00.** Browsers throttle background timers to roughly once a minute. The script plays a near-silent tone for the last two minutes so the tab stays exempt, but a visible tab is still the reliable answer.
+- **One booking per target.** After a target has been booked it stops looking, so you never end up with three bookings for the same slot window by accident. This holds in the normal mode too.
 
 ---
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SJTU 体育场馆捡漏助手
 // @namespace    sjtu-sport-monitor
-// @version      1.1.0
+// @version      1.2.0
 // @description  监控交大体育场馆空余名额：可配置多个「场馆+项目+日期+时段」；发现名额先提醒，5 分钟内你不自行预约就自动下单，下单后提醒付款。也有「检测到立即下单」模式。
 // @author       -
 // @match        https://sports.sjtu.edu.cn/pc/*
@@ -52,6 +52,7 @@
     desktopNotify: true,
     soundNotify: true,
     webhook: '',
+    snipe: { enabled: false, leadMs: 1500, windowSec: 25, intervalMs: 400 },
     targets: []
   };
 
@@ -74,6 +75,11 @@
 
   const cfg = Object.assign({}, DEFAULT_CFG, store.get('ssm_cfg', {}));
   if (!Array.isArray(cfg.targets)) cfg.targets = [];
+  if (!cfg.snipe || typeof cfg.snipe !== 'object') cfg.snipe = {};
+  if (cfg.snipe.enabled === undefined) cfg.snipe.enabled = false;
+  if (cfg.snipe.leadMs === undefined) cfg.snipe.leadMs = 1500;
+  if (cfg.snipe.windowSec === undefined) cfg.snipe.windowSec = 25;
+  if (cfg.snipe.intervalMs === undefined) cfg.snipe.intervalMs = 400;
   const saveCfg = () => store.set('ssm_cfg', cfg);
 
   /* ============================ 工具 ============================ */
@@ -486,6 +492,7 @@
     lastErr: '',
     pending: {},   // key -> { until, item }
     done: {},      // key -> orderId
+    sat: {},       // targetId -> orderId（这个目标已经约到了，别再约）
     pay: [],       // { orderId, url, at, notified5, notified10 }
     logs: []
   };
@@ -542,8 +549,11 @@
         await sleep(rnd(250, 600));
         const byDate = new Map(allDates.map(x => [x.date, x.dateId]));
 
+        const active = g.targets.filter(function (t) { return !S.sat[t.id]; });
+        if (!active.length) continue;
+
         const wantDates = new Set();
-        for (const t of g.targets) {
+        for (const t of active) {
           const ds = Array.isArray(t.dates) && t.dates.length ? t.dates : [...byDate.keys()];
           ds.forEach(d => { if (byDate.has(d)) wantDates.add(d); });
         }
@@ -556,11 +566,11 @@
           await sleep(rnd(250, 600));
 
           const wantSlots = new Set();
-          for (const t of g.targets) {
+          for (const t of active) {
             const want = (Array.isArray(t.dates) && t.dates.length && !t.dates.includes(date)) ? false : true;
             if (!want) continue;
             const ss = Array.isArray(t.slots) && t.slots.length ? t.slots : SLOTS.map((_, i) => i);
-            ss.forEach(s => wantSlots.add(s));
+            ss.forEach(n => wantSlots.add(n));
           }
 
           for (const field of fieldList) {
@@ -576,7 +586,15 @@
               seen.add(k);
               if (S.done[k]) continue;
 
-              await onAvailable(k, g, date, slot, cell, field, dateId);
+              // 哪些还没满足的目标要这个「日期+时段」
+              const hits = active.filter(function (t) {
+                const okD = !(Array.isArray(t.dates) && t.dates.length) || t.dates.includes(date);
+                const okS = !(Array.isArray(t.slots) && t.slots.length) || t.slots.includes(slot);
+                return okD && okS && !S.sat[t.id];
+              });
+              if (!hits.length) continue;
+
+              await onAvailable(k, g, date, slot, cell, field, dateId, hits);
             }
           }
         }
@@ -609,9 +627,9 @@
     }
   }
 
-  async function onAvailable(k, g, date, slot, cell, field, dateId) {
+  async function onAvailable(k, g, date, slot, cell, field, dateId, hits) {
     const target = { venueId: g.venueId, venueName: g.venueName, typeId: g.typeId, typeName: g.typeName, tension: g.tension };
-    const item = { key: k, target, date, slot, cell, field, dateId, remaining: cell.count };
+    const item = { key: k, target, date, slot, cell, field, dateId, remaining: cell.count, hits: hits || [] };
 
     if (cfg.mode === 'direct') {
       await doOrder(item);
@@ -630,7 +648,11 @@
 
     // 刷新凭证
     p.item = item;
-    if (Date.now() >= p.until) await doOrder(item);
+    if (Date.now() >= p.until) {
+      const still = (item.hits || []).some(function (t) { return !S.sat[t.id]; });
+      if (!still) { delete S.pending[k]; return; }   // 目标已经约到了，别重复下单
+      await doOrder(item);
+    }
   }
 
   async function doOrder(item) {
@@ -654,6 +676,7 @@
 
       S.done[k] = out;
       delete S.pending[k];
+      for (const t of (item.hits || [])) S.sat[t.id] = out;
       log('✅ 下单成功 订单号 ' + out, 'ok');
 
       let payLink = '';
@@ -697,7 +720,8 @@
 
   function allDone() {
     if (!cfg.targets.length) return false;
-    return cfg.targets.every(t => {
+    return cfg.targets.every(function (t) {
+      if (S.sat[t.id]) return true;
       const prefix = fieldKey(t.venueId, t.typeId) + '|';
       return Object.keys(S.done).some(k => k.startsWith(prefix) && S.done[k] && String(S.done[k]).length > 5);
     });
@@ -715,12 +739,16 @@
     log('开始监控，轮询间隔 ' + cfg.pollSec + ' 秒', 'ok');
     renderStatus();
     loop();
+    syncClock().then(function () { armSnipe(); });
   }
 
   function stop(reason) {
     S.running = false;
     store.set('ssm_running', '0');
     if (S.timer) { clearTimeout(S.timer); S.timer = null; }
+    if (snipeTimer) { clearTimeout(snipeTimer); snipeTimer = null; }
+    S.snipeAt = 0;
+    keepAliveAudio(false);
     if (reason) log('已停止（' + reason + '）', 'warn');
     renderStatus();
   }
@@ -733,6 +761,11 @@
     S.timer = setTimeout(loop, ms);
   }
 
+  // 抢放号倒计时：每秒刷新一次状态行
+  setInterval(() => {
+    if (S.running && cfg.snipe.enabled) renderStatus();
+  }, 1000);
+
   // 付款提醒：下单后 5 / 10 分钟各提醒一次
   setInterval(() => {
     const now = Date.now();
@@ -743,6 +776,179 @@
     }
     renderStatus();
   }, 30000);
+
+  /* ============================ 12:00 放号抢单 ============================ */
+
+  let srvOffset = 0;      // 服务器时间 - 本地时间
+  let snipeTimer = null;  // 武装用的定时器
+  let sniping = false;
+  let keepAlive = null;
+
+  function serverNow() { return Date.now() + srvOffset; }
+
+  // 用响应头里的 Date 校准服务器时间（北京时间和服务器同一时区）
+  async function syncClock() {
+    // Date 响应头只精确到秒（向下取整），所以真值落在 [srv, srv+1000)，
+    // 取 +500ms 作为期望值；多次采样取 RTT 最小的那次。
+    let best = null;
+    for (let i = 0; i < 3; i++) {
+      const t0 = Date.now();
+      try {
+        const res = await fetch(location.origin + '/pc/?_=' + t0, { method: 'HEAD', cache: 'no-store' });
+        const t1 = Date.now();
+        const srv = Date.parse(res.headers.get('date') || '');
+        if (isFinite(srv)) {
+          const rtt = t1 - t0;
+          const off = srv + 500 - (t0 + rtt / 2);
+          if (!best || rtt < best.rtt) best = { off: off, rtt: rtt };
+        }
+      } catch (e) { }
+      await sleep(120);
+    }
+    if (best) {
+      srvOffset = Math.round(best.off);
+      log('与服务器对时完成：本地快/慢 ' + srvOffset + ' ms（误差约 ±0.5 秒）', 'muted');
+    }
+    return srvOffset;
+  }
+
+  // 下一个 12:00:00，返回本地时钟的毫秒
+  function nextReleaseAt() {
+    const t = new Date(Date.now() + srvOffset);
+    t.setHours(12, 0, 0, 0);
+    let at = t.getTime() - srvOffset;
+    if (at <= Date.now() + 1000) at += 86400000;
+    return at;
+  }
+
+  // 后台标签页的定时器会被拖慢到 1 分钟一次。播放音频的标签页不受节流，
+  // 所以临开抢前放一个几乎无声的音，把标签页"点亮"。
+  function keepAliveAudio(on) {
+    try {
+      if (on) {
+        if (keepAlive) return;
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        g.gain.value = 0.0008;
+        osc.frequency.value = 40;
+        osc.connect(g); g.connect(ctx.destination);
+        osc.start();
+        keepAlive = { ctx: ctx, osc: osc };
+        log('已开启保活音频，防止后台节流拖慢定时器', 'muted');
+      } else if (keepAlive) {
+        try { keepAlive.osc.stop(); keepAlive.ctx.close(); } catch (e) { }
+        keepAlive = null;
+      }
+    } catch (e) { }
+  }
+
+  function armSnipe() {
+    if (snipeTimer) { clearTimeout(snipeTimer); snipeTimer = null; }
+    S.snipeAt = 0;
+    if (!S.running || !cfg.snipe.enabled || !cfg.targets.length) { keepAliveAudio(false); renderStatus(); return; }
+
+    const at = nextReleaseAt();
+    S.snipeAt = at;
+    const wait = at - cfg.snipe.leadMs - Date.now();
+    if (wait <= 0) { setTimeout(onSnipeFire, 60); return; }
+
+    snipeTimer = setTimeout(onSnipeFire, wait);
+    if (wait < 130000) keepAliveAudio(true);
+    else setTimeout(function () { if (S.running && cfg.snipe.enabled) keepAliveAudio(true); }, wait - 120000);
+
+    log('已武装 12:00 抢放号：' + new Date(at).toLocaleString('zh-CN'), 'ok');
+    renderStatus();
+  }
+
+  async function onSnipeFire() {
+    snipeTimer = null;
+    const at = S.snipeAt || 0;
+    await syncClock();
+    const late = at ? (Date.now() + srvOffset) - at : 0;
+    if (at && late > (cfg.snipe.windowSec + 20) * 1000) {
+      log('错过本日 12:00（大概睡过了：晚了 ' + Math.round(late / 1000) + ' 秒），本次跳过', 'warn');
+    } else {
+      await snipeBurst(late > 3000 ? '唤醒后补抢' : '定时 12:00');
+    }
+    keepAliveAudio(false);
+    if (S.running) armSnipe();
+  }
+
+  async function snipeBurst(why) {
+    if (sniping) return;
+    if (!cfg.targets.length) { notify('无法抢', '还没有任何目标'); return; }
+    sniping = true;
+    const t0 = Date.now();
+    const deadline = t0 + Math.max(5, cfg.snipe.windowSec) * 1000;
+    const gs = groups();
+    const dateCache = new Map();
+    let tries = 0, booked = 0;
+
+    log('⏰ 开始抢放号（' + why + '），窗口 ' + cfg.snipe.windowSec + ' 秒 / 间隔 ' + cfg.snipe.intervalMs + 'ms', 'ok');
+    notify('12:00 抢放号开始', '正在高频刷新目标场馆，抢到会立刻下单', { kind: 'info' });
+
+    try {
+      while (Date.now() < deadline && S.running) {
+        for (let gi = 0; gi < gs.length && booked === 0; gi++) {
+          const g = gs[gi];
+          if (Date.now() >= deadline) break;
+          const gk = fieldKey(g.venueId, g.typeId);
+
+          let dates = null;
+          const cached = dateCache.get(gk);
+          if (cached && Date.now() - cached.at < 2000) dates = cached.dates;
+          if (!dates) {
+            try {
+              dates = await api.dates(g.venueId, g.typeId);
+              dateCache.set(gk, { dates: dates, at: Date.now() });
+            } catch (e) { await sleep(250); continue; }
+          }
+          const newest = dates && dates[dates.length - 1];
+          if (!newest) continue;
+
+          const activeT = g.targets.filter(function (t) { return !S.sat[t.id]; });
+          if (!activeT.length) continue;
+          const want = new Set();
+          for (const t of activeT) (t.slots || []).forEach(function (x) { want.add(x); });
+          const slots = want.size ? [...want].sort(function (a, b) { return a - b; })
+                                  : SLOTS.map(function (_, i) { return i; });
+
+          let fields;
+          try { fields = await api.fields(g.venueId, g.typeId, newest.date, newest.dateId); }
+          catch (e) { await sleep(250); continue; }
+          tries++;
+
+          for (const field of fields) {
+            const list = field.priceList || [];
+            for (const slot of slots) {
+              const cell = list[slot];
+              if (!cell) continue;
+              if (String(cell.status) !== '0') continue;
+              if (Number(cell.count) <= 0) continue;
+              const k = keyOf(g.venueId, g.typeId, newest.date, slot);
+              if (S.done[k]) continue;
+              log('抢到空位：' + newest.date + ' ' + SLOTS[slot] + '，立即下单', 'ok');
+              await doOrder({ key: k, target: g, date: newest.date, slot: slot, cell: cell, field: field, dateId: newest.dateId, remaining: cell.count });
+              if (String(S.done[k] || '').length > 5) booked++;
+              break;
+            }
+            if (booked) break;
+          }
+        }
+        if (booked) break;
+        await sleep(rnd(cfg.snipe.intervalMs * 0.8, cfg.snipe.intervalMs * 1.2));
+      }
+    } catch (e) {
+      log('抢放号异常：' + e.message, 'err');
+    } finally {
+      sniping = false;
+      const secs = Math.round((Date.now() - t0) / 1000);
+      log('抢放号结束：' + secs + ' 秒内刷新 ' + tries + ' 轮，成功 ' + booked + ' 单', booked ? 'ok' : 'warn');
+      if (!booked) notify('这一轮没抢到', secs + ' 秒内没出现可约名额，可能已经被抢光了');
+      renderStatus();
+    }
+  }
 
   /* ============================ 界面 ============================ */
 
@@ -930,6 +1136,14 @@
     if (Object.keys(S.pending).length) parts.push('待确认 ' + Object.keys(S.pending).length + ' 个');
     const doneN = Object.values(S.done).filter(v => v && String(v).length > 5).length;
     if (doneN) parts.push('已下单 ' + doneN);
+    if (S.running && cfg.snipe.enabled) {
+      const at = S.snipeAt || nextReleaseAt();
+      const left = Math.max(0, at - Date.now());
+      const hh = Math.floor(left / 3600000);
+      const mm = Math.floor(left % 3600000 / 60000);
+      const ss = Math.floor(left % 60000 / 1000);
+      parts.push('⏰ 距放号 ' + (hh ? hh + ' 小时 ' : '') + mm + ' 分 ' + ss + ' 秒');
+    }
 
     statusBox.innerHTML = '';
     parts.forEach((p, i) => {
@@ -1014,6 +1228,47 @@
     );
     modeSec.append(m1, m2);
     b.appendChild(modeSec);
+
+    // --- 12:00 抢放号
+    const snSec = h('div', { class: 'sec' });
+    snSec.appendChild(h('div', { class: 'lbl', text: '⏰ 12:00 放号抢单' }));
+    snSec.appendChild(h('label', { class: 'row', style: 'cursor:pointer' },
+      h('input', {
+        type: 'checkbox', checked: !!cfg.snipe.enabled,
+        onchange: (e) => { cfg.snipe.enabled = e.target.checked; saveCfg(); if (S.running) armSnipe(); renderAll(); }
+      }),
+      h('span', { text: '每天 12:00 自动抢（沿用上面目标的时段，抢最新放出的那一天）' })
+    ));
+    snSec.appendChild(h('div', { class: 'row', style: 'margin:6px 0 0 22px;gap:5px;flex-wrap:wrap' },
+      h('span', { class: 'hint', text: '提前' }),
+      h('input', {
+        type: 'number', min: 0, max: 30, value: Math.round(cfg.snipe.leadMs / 1000), style: 'width:44px',
+        onchange: (e) => { cfg.snipe.leadMs = Math.max(0, Math.min(30, Number(e.target.value) || 0)) * 1000; saveCfg(); }
+      }),
+      h('span', { class: 'hint', text: '秒开抢，持续' }),
+      h('input', {
+        type: 'number', min: 5, max: 120, value: cfg.snipe.windowSec, style: 'width:44px',
+        onchange: (e) => { cfg.snipe.windowSec = Math.max(5, Math.min(120, Number(e.target.value) || 25)); saveCfg(); }
+      }),
+      h('span', { class: 'hint', text: '秒，间隔' }),
+      h('input', {
+        type: 'number', min: 150, max: 5000, step: 50, value: cfg.snipe.intervalMs, style: 'width:56px',
+        onchange: (e) => { cfg.snipe.intervalMs = Math.max(150, Math.min(5000, Number(e.target.value) || 400)); saveCfg(); }
+      }),
+      h('span', { class: 'hint', text: '毫秒' })
+    ));
+    snSec.appendChild(h('div', { class: 'row', style: 'margin:8px 0 0 22px;gap:8px' },
+      h('button', { class: 'btn ghost', text: '对时', title: '用服务器时间校准本地时钟', onclick: async () => { await syncClock(); renderAll(); } }),
+      h('button', {
+        class: 'btn', text: '立即抢一轮',
+        onclick: () => { if (!S.running) { notify('无法抢', '请先点「开始监控」'); return; } snipeBurst('手动'); }
+      })
+    ));
+    snSec.appendChild(h('div', {
+      class: 'hint', style: 'margin-top:6px',
+      text: '抢放号时不做"先提醒后下单"，发现空位立即下单。12:00 前请让本标签页保持可见。'
+    }));
+    b.appendChild(snSec);
 
     // --- 添加目标
     const addSec = h('div', { class: 'sec' });
@@ -1228,7 +1483,14 @@
   async function bootInner() {
     buildUI();
     log('助手已加载', 'ok');
-    try { window.__ssm = { notify: notify, focusAlert: focusAlert, dismissAlert: dismissAlert, pushTest: pushTest, cfg: cfg, S: S }; } catch (e) { }
+    try {
+      window.__ssm = {
+        notify: notify, focusAlert: focusAlert, dismissAlert: dismissAlert, pushTest: pushTest,
+        cfg: cfg, S: S, saveCfg: saveCfg, start: start, stop: stop,
+        syncClock: syncClock, armSnipe: armSnipe, snipeBurst: snipeBurst,
+        nextReleaseAt: nextReleaseAt, serverNow: serverNow, api: api
+      };
+    } catch (e) { }
     try {
       VENUES = await api.venues();
       log('场馆列表加载完成，共 ' + VENUES.length + ' 个', 'muted');
