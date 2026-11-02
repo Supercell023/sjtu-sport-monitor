@@ -1006,6 +1006,8 @@
     .btn.primary:hover { background: #a80e26; }
     .btn.ghost { border-color: transparent; color: #888; }
     .btn:disabled { opacity: .45; cursor: not-allowed; }
+    input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; appearance: textfield; text-align: center; }
     .sec { margin-top: 13px; padding-top: 11px; border-top: 1px dashed #ececec; }
     .lbl { color: #888; font-size: 11.5px; margin-bottom: 6px; }
     .chips { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -1242,17 +1244,17 @@
     snSec.appendChild(h('div', { class: 'row', style: 'margin:6px 0 0 22px;gap:5px;flex-wrap:wrap' },
       h('span', { class: 'hint', text: '提前' }),
       h('input', {
-        type: 'number', min: 0, max: 30, value: Math.round(cfg.snipe.leadMs / 1000), style: 'width:44px',
+        type: 'number', min: 0, max: 30, value: Math.round(cfg.snipe.leadMs / 1000), style: 'width:52px',
         onchange: (e) => { cfg.snipe.leadMs = Math.max(0, Math.min(30, Number(e.target.value) || 0)) * 1000; saveCfg(); }
       }),
       h('span', { class: 'hint', text: '秒开抢，持续' }),
       h('input', {
-        type: 'number', min: 5, max: 120, value: cfg.snipe.windowSec, style: 'width:44px',
+        type: 'number', min: 5, max: 120, value: cfg.snipe.windowSec, style: 'width:52px',
         onchange: (e) => { cfg.snipe.windowSec = Math.max(5, Math.min(120, Number(e.target.value) || 25)); saveCfg(); }
       }),
       h('span', { class: 'hint', text: '秒，间隔' }),
       h('input', {
-        type: 'number', min: 150, max: 5000, step: 50, value: cfg.snipe.intervalMs, style: 'width:56px',
+        type: 'number', min: 150, max: 5000, step: 50, value: cfg.snipe.intervalMs, style: 'width:64px',
         onchange: (e) => { cfg.snipe.intervalMs = Math.max(150, Math.min(5000, Number(e.target.value) || 400)); saveCfg(); }
       }),
       h('span', { class: 'hint', text: '毫秒' })
