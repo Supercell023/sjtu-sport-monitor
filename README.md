@@ -95,6 +95,29 @@ Paste with or without `< >` and quotes — the script strips them. Click **test 
 
 ---
 
+## Login expiry
+
+There are **two layers** of session, and either one expiring breaks polling:
+
+| Layer | What it is | Kept alive by |
+|---|---|---|
+| `sports.sjtu.edu.cn` | `JSESSIONID`, a session cookie held only in browser memory | request activity; **lost whenever the browser closes** |
+| `jaccount.sjtu.edu.cn` | the SSO session itself | its own TTL — the site cannot extend it |
+
+The script handles this three ways:
+
+**① Auto re-login** (on by default). When a request hits the login page, the script saves state, fires a notification and navigates to the SSO endpoint. If jaccount is still alive the page bounces straight back and monitoring resumes 3 seconds later; if not, you land on the familiar login form, sign in once, and it resumes the same way.
+
+**② Idle keep-alive** (every 10 minutes) pings the session so the server does not reap it while you are not monitoring.
+
+**③ Proactive renewal** (every 4 hours by default) does a full round-trip through SSO, refreshing both layers and turning an unpredictable expiry into a scheduled one. It is skipped within 10 minutes of the 12:00 release and whenever an order is pending.
+
+What it still cannot do: **password-free survival across a browser restart.** `JSESSIONID` is session-scoped, and whether SSO silently re-authenticates depends on jaccount's own state. Automating the password field is out of scope — the login form has a captcha and automated login carries more risk than the booking itself.
+
+Best setup: **pin the tab** and let Edge restore it on startup.
+
+---
+
 ## Verified behaviour
 
 - Slot detection on a live account — `status == 0` and `count > 0`.

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SJTU 体育场馆捡漏助手
 // @namespace    sjtu-sport-monitor
-// @version      1.2.0
-// @description  监控交大体育场馆空余名额：可配置多个「场馆+项目+日期+时段」；发现名额先提醒，5 分钟内你不自行预约就自动下单，下单后提醒付款。也有「检测到立即下单」模式。
+// @version      1.3.0
+// @description  检测校体育场馆的空位（有人取消预约时），自动下单并提醒付款；支持 12:00 抢放号、登录失效自动重登
 // @author       -
 // @match        https://sports.sjtu.edu.cn/pc/*
 // @match        https://sports.sjtu.edu.cn/*
@@ -52,6 +52,9 @@
     desktopNotify: true,
     soundNotify: true,
     webhook: '',
+    autoRelogin: true,     // 登录失效时自动跳转统一身份认证重登
+    keepAliveSec: 600,     // 空闲时多久探一次登录态（秒），0=关闭
+    renewSec: 14400,       // 主动静默续期间隔（秒），0=关闭；4 小时
     snipe: { enabled: false, leadMs: 1500, windowSec: 25, intervalMs: 400 },
     targets: []
   };
@@ -97,6 +100,119 @@
   const fieldKey = (venueId, typeId) => venueId + '|' + typeId;
 
   class SessionLost extends Error { constructor() { super('登录已失效'); this.name = 'SessionLost'; } }
+
+  /* ============================ 登录态 ============================ */
+
+  let reloginPending = false;
+  let sessEl = null;
+  let lastWhoAt = 0;
+  let sessState = { ok: null, name: '', at: 0 };
+
+  const AUTH_URL_BASE = 'https://jaccount.sjtu.edu.cn/oauth2/authorize' +
+    '?response_type=code&client_id=mB5nKHqC00MusWAgnqSF&state=8&redirect_uri=';
+
+  function authUrl() {
+    return AUTH_URL_BASE + encodeURIComponent(location.origin + '/oauth2Login');
+  }
+
+  // 当前登录者；未登录返回 null
+  async function whoami() {
+    try {
+      const res = await fetch(location.origin + '/system/user/currentUser',
+        { credentials: 'include', cache: 'no-store' });
+      if (!res.ok) return null;
+      if (res.redirected && /\/login/.test(new URL(res.url).pathname)) return null;
+      const j = await res.json();
+      const d = j && j.data;
+      return (d && (d.userName || d.loginName)) || null;
+    } catch (e) { return null; }
+  }
+
+  function renderSess() {
+    if (!sessEl || !sessEl.isConnected) return;
+    if (sessState.ok === null) { sessEl.textContent = '未检查'; sessEl.style.color = ''; return; }
+    if (sessState.ok) { sessEl.textContent = '✅ ' + sessState.name; sessEl.style.color = '#2e7d32'; }
+    else { sessEl.textContent = '⚠️ 未登录'; sessEl.style.color = '#c62828'; }
+  }
+
+  async function checkNow() {
+    const name = await whoami();
+    sessState = { ok: !!name, name: name || '', at: Date.now() };
+    lastWhoAt = Date.now();
+    renderSess();
+    return name;
+  }
+
+  function haltForLogin() {
+    S.running = false;
+    if (S.timer) { clearTimeout(S.timer); S.timer = null; }
+    try { if (snipeTimer) { clearTimeout(snipeTimer); snipeTimer = null; } } catch (e) { }
+    S.snipeAt = 0;
+    try { keepAliveAudio(false); } catch (e) { }
+    renderStatus();
+  }
+
+  // 登录失效 → 跳统一身份认证。会话还在就秒回，需要的话人工过一次登录，回来自动续监控。
+  function relogin(reason) {
+    if (reloginPending) return;
+    reloginPending = true;
+    haltForLogin();
+    sessState = { ok: false, name: '', at: Date.now() };
+    renderSess();
+    // 注意：不写 ssm_running=0 —— 登录回来后靠这个标记自动恢复监控
+
+    if (cfg.autoRelogin === false) {
+      log('登录已失效（' + reason + '），自动重登已关闭', 'err');
+      notify('登录已失效', '监控已暂停。请在页面上重新登录，然后点「开始监控」。', { kind: 'warn' });
+      reloginPending = false;
+      return;
+    }
+
+    const now = Date.now();
+    let n = Number(store.get('ssm_rl_n', '0')) || 0;
+    const at = Number(store.get('ssm_rl_at', '0')) || 0;
+    if (!at || now - at > 10 * 60 * 1000) n = 0;
+    if (n >= 3) {
+      store.set('ssm_rl_n', '0');
+      log('自动重登连续失败，已停止尝试', 'err');
+      notify('登录已失效，自动重登失败', '连续 3 次都没恢复登录。请手动登录一次，回来自动继续监控。', { kind: 'warn' });
+      reloginPending = false;
+      return;
+    }
+    store.set('ssm_rl_n', String(n + 1));
+    store.set('ssm_rl_at', String(now));
+
+    log('登录已失效（' + reason + '），正在跳转统一身份认证重登（第 ' + (n + 1) + ' 次）', 'warn');
+    notify('登录已过期，正在自动重新登录…',
+      '若统一身份认证仍在线，几秒后会自动回来继续监控；否则请在跳转后的登录页完成登录。', { kind: 'warn' });
+    setTimeout(() => { location.replace(authUrl()); }, 1500);
+  }
+
+  // 空闲保活：不开监控时也定期碰一下，让服务端会话不因闲置被回收
+  // 主动续期：整页跳一次统一身份认证再被弹回来，等于给两层会话都续了一次命。
+  // 放号前后、有 pending 订单时不打扰。
+  function maybeRenew() {
+    if (!cfg.renewSec || reloginPending || !S.running) return;
+    if (S.ordering || Object.keys(S.pending).length) return;
+    if (!srvOffset) return;
+    const ra = nextReleaseAt();
+    if (ra && Math.abs(ra - Date.now()) < 10 * 60 * 1000) return;
+    if (Date.now() - (Number(store.get('ssm_renew_at', '0')) || 0) < cfg.renewSec * 1000) return;
+    store.set('ssm_renew_at', String(Date.now()));
+    log('主动续期：跳一次统一身份认证以延长登录有效期', 'muted');
+    location.replace(authUrl());
+  }
+
+  function keepAlivePing() {
+    if (!cfg.keepAliveSec) return;
+    if (S.running || S.ordering || reloginPending) return;
+    if (Date.now() - lastWhoAt < Math.max(60, cfg.keepAliveSec) * 1000) return;
+    lastWhoAt = Date.now();
+    whoami().then(function (name) {
+      sessState = { ok: !!name, name: name || '', at: Date.now() };
+      renderSess();
+    });
+  }
 
   /* ============================ 网络 ============================ */
 
@@ -615,8 +731,7 @@
     } catch (err) {
       S.lastErr = err.message || String(err);
       if (err instanceof SessionLost) {
-        notify('登录已失效', '监控已暂停，请重新登录后点击「继续」');
-        stop('session');
+        relogin('检查空位时发现登录失效');
       } else {
         log('错误：' + S.lastErr, 'err');
       }
@@ -705,8 +820,7 @@
       }
     } catch (err) {
       if (err instanceof SessionLost) {
-        notify('登录已失效', '下单失败，请重新登录');
-        stop('session');
+        relogin('自动下单时发现登录失效');
       } else {
         log('下单失败：' + err.message, 'err');
         delete S.pending[k];
@@ -1385,6 +1499,33 @@
       }),
       h('span', { text: '下单后自动打开付款页' })
     ));
+    nSec.appendChild(h('label', { class: 'row', style: 'cursor:pointer;margin-bottom:5px' },
+      h('input', {
+        type: 'checkbox', checked: cfg.autoRelogin !== false,
+        onchange: (e) => { cfg.autoRelogin = e.target.checked; saveCfg(); }
+      }),
+      h('span', { text: '登录失效时自动跳转重登' })
+    ));
+    nSec.appendChild(h('label', { class: 'row', style: 'cursor:pointer;margin-bottom:5px' },
+      h('input', {
+        type: 'checkbox', checked: cfg.renewSec !== 0,
+        onchange: (e) => { cfg.renewSec = e.target.checked ? 14400 : 0; saveCfg(); renderAll(); }
+      }),
+      h('span', { text: '每隔' }),
+      h('input', {
+        type: 'number', min: 0, max: 24, value: Math.round((cfg.renewSec || 0) / 3600),
+        style: 'width:46px',
+        onchange: (e) => { cfg.renewSec = Math.max(0, Math.min(24, Number(e.target.value) || 0)) * 3600; saveCfg(); }
+      }),
+      h('span', { text: '小时主动续期一次（0=关）' })
+    ));
+    nSec.appendChild(h('div', { class: 'row', style: 'gap:6px;margin-top:2px;margin-bottom:5px' },
+      h('button', {
+        class: 'btn ghost', text: '检查登录', style: 'flex:0 0 auto',
+        onclick: () => { checkNow().then(n => { if (n) log('登录状态正常：' + n, 'ok'); else log('当前未登录', 'warn'); }); }
+      }),
+      (sessEl = h('span', { text: '未检查', style: 'font-size:12px' }))
+    ));
     nSec.appendChild(h('div', { class: 'row', style: 'gap:6px;margin-top:5px' },
       h('input', {
         type: 'text', placeholder: '手机推送地址：Bark / Server酱 / ntfy',
@@ -1490,7 +1631,9 @@
         notify: notify, focusAlert: focusAlert, dismissAlert: dismissAlert, pushTest: pushTest,
         cfg: cfg, S: S, saveCfg: saveCfg, start: start, stop: stop,
         syncClock: syncClock, armSnipe: armSnipe, snipeBurst: snipeBurst,
-        nextReleaseAt: nextReleaseAt, serverNow: serverNow, api: api
+        nextReleaseAt: nextReleaseAt, serverNow: serverNow, api: api,
+        whoami: whoami, checkNow: checkNow, relogin: relogin, authUrl: authUrl, keepAlivePing: keepAlivePing,
+        maybeRenew: maybeRenew
       };
     } catch (e) { }
     try {
@@ -1504,11 +1647,23 @@
 
     // 上次是运行状态 → 自动恢复（页面刷新/重进后不用重新点）
     try {
-      if (store.get('ssm_running', '0') === '1' && cfg.targets.length) {
-        log('检测到上次处于运行状态，3 秒后自动恢复监控', 'muted');
-        setTimeout(() => { if (!S.running) start(); renderAll(); }, 3000);
+      const wasRunning = store.get('ssm_running', '0') === '1' && cfg.targets.length > 0;
+      const name = await checkNow();
+      if (name) {
+        store.set('ssm_rl_n', '0');   // 登录成功，重置重登计数
+        if (wasRunning) {
+          log('检测到上次处于运行状态，3 秒后自动恢复监控', 'muted');
+          setTimeout(() => { if (!S.running) start(); renderAll(); }, 3000);
+        }
+      } else if (wasRunning) {
+        log('上次处于运行状态，但当前未登录', 'warn');
+        setTimeout(() => relogin('页面加载时发现未登录'), 800);
+      } else {
+        log('当前未登录（未在监控状态）', 'muted');
       }
-    } catch (e) { }
+    } catch (e) { log('登录检查异常：' + (e && e.message), 'err'); }
+    setInterval(keepAlivePing, 30000);
+    setInterval(maybeRenew, 5 * 60 * 1000);
   }
 
   async function boot() {

@@ -110,3 +110,15 @@ body: Base64( AES-128-ECB-PKCS7( JSON({venTypeId, venueId, fieldType, scheduleDa
 - 前端路由（hash）：`#/Order` 我的订单、`#/orderDetails/:type` 订单详情、`#/apointmentDetails/:state/:id/:isType/:bizId` 选座页。
 - 页面 Vue 根实例上有现成的 `Aes` / `Rsa`（`document.getElementById('app').__vue__.Aes/Rsa`），
   脚本直接复用，AES-128-ECB 与页面实现逐字节一致（已验证）。
+
+## 8. 登录态（两层）
+
+- **场馆站**：`JSESSIONID`，会话级 cookie（无 Max-Age），只存在浏览器内存，**关浏览器即丢**；
+  服务端闲置超时会回收，靠请求活动续命。未登录访问受保护接口 → `302 Location: /login`。
+- **统一身份认证**：`jaccount.sjtu.edu.cn` 的独立会话（含持久化的 `JATrustCookie`）。
+  `JATrustCookie` **单独不足以认证**——只用它跑 OAuth 仍会 302 到 `/jaccount/jalogin`，
+  说明还需要 jaccount 侧的内存会话。故纯后台进程无法只凭 cookie 静默续期。
+- **续期方式**（脚本采用）：整页跳
+  `https://jaccount.sjtu.edu.cn/oauth2/authorize?response_type=code&client_id=mB5nKHqC00MusWAgnqSF&state=8&redirect_uri=<origin>/oauth2Login`，
+  会话在线时静默回跳并重建 JSESSIONID；离线时落到登录页，人工登录后同样回到 `/pc/`。
+- **登录态探测**：`GET /system/user/currentUser` → 已登录返回 `data.userName`；未登录 `{code:0}` 无 `data`（不报错，注意别按 code 判断）。
