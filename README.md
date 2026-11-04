@@ -152,13 +152,32 @@ The author does not encourage breaking these rules and accepts no liability for 
 
 ---
 
+## Running in the background
+
+Yes — the tab does not need to be in front. Because browsers throttle timers in hidden tabs, the script carries three defences:
+
+| Defence | What it does |
+|---|---|
+| **Worker timers** | The polling loop and the snipe wake-up run inside a Web Worker. After five minutes hidden the browser clamps ordinary timers to once a minute; worker timers are not clamped. |
+| **Keep-alive audio** | Two minutes before the release it plays a 40 Hz tone at 0.08% volume, marking the tab as playing audio and keeping it out of intensive throttling. |
+| **Catch-up on return** | When the tab becomes visible again and the last check is older than two poll intervals, it checks immediately instead of waiting. |
+
+Measured with the tab hidden for 7 minutes and the poll set to 30 s: `29,30,32,29,35,37,32,37,32,34,32,35` — past the 5-minute threshold, and never stretched to 60 s.
+
+Two differences while it runs in the background:
+
+- **The payment page will not pop up.** A hidden tab has no user activation, so `window.open` is blocked. The script copies the pay link to the clipboard and includes it in the push, so you can open it when you come back.
+- **A sleeping machine runs nothing.** Closing the lid freezes the tab; no script can avoid that.
+
+---
+
 ## Limitations
 
 - **Your computer has to stay on** with the tab open. The script runs in the browser, not on a server — phone push removes the need to watch the screen, not the need for a live browser.
-- **Background tabs are throttled.** Browsers slow timers in hidden tabs (to roughly once a minute after five minutes), so keep the tab pinned or in its own window.
 - If the site ever starts demanding a slider CAPTCHA, the script reports it and stops rather than fighting it.
 - PC pages only (`/pc/`).
 - The encryption layer depends on the page's own Vue instance; a major front-end rewrite may require updating.
+- Don't lose the network while it runs in the background: repeated failures may be misread as an expired login.
 
 ---
 

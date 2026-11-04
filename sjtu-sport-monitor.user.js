@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SJTU 体育场馆捡漏助手
 // @namespace    sjtu-sport-monitor
-// @version      1.3.0
-// @description  检测校体育场馆的空位（有人取消预约时），自动下单并提醒付款；支持 12:00 抢放号、登录失效自动重登
+// @version      1.4.0
+// @description  检测校体育场馆的空位（有人取消预约时），自动下单并提醒付款；支持 12:00 抢放号、登录失效自动重登、后台标签页运行
 // @author       -
 // @match        https://sports.sjtu.edu.cn/pc/*
 // @match        https://sports.sjtu.edu.cn/*
@@ -145,8 +145,8 @@
 
   function haltForLogin() {
     S.running = false;
-    if (S.timer) { clearTimeout(S.timer); S.timer = null; }
-    try { if (snipeTimer) { clearTimeout(snipeTimer); snipeTimer = null; } } catch (e) { }
+    if (S.timer) { try { WT.clear(S.timer); } catch (e) { } S.timer = null; }
+    try { if (snipeTimer) { WT.clear(snipeTimer); snipeTimer = null; } } catch (e) { }
     S.snipeAt = 0;
     try { keepAliveAudio(false); } catch (e) { }
     renderStatus();
@@ -803,7 +803,13 @@
           renderStatus();
           if (cfg.autoOpenPay) {
             const w = window.open(pr.url, '_blank');
-            if (!w) log('浏览器拦截了自动弹出，请点面板上的「去付款」按钮', 'warn');
+            if (!w) {
+              // 后台标签页没有用户激活，弹窗会被拦；把链接复制好，人回来一粘就能付
+              log('浏览器拦截了自动打开付款页（后台标签页常见），链接已复制到剪贴板，去付款时粘贴即可', 'warn');
+              try { if (navigator.clipboard) navigator.clipboard.writeText(pr.url).catch(function () { }); } catch (e) { }
+            }
+          } else {
+            log('付款链接：' + pr.url, 'muted');
           }
         } else {
           log('支付链接获取失败：' + (pr.msg || '未知'), 'warn');
@@ -851,6 +857,7 @@
     S.lastErr = '';
     store.set('ssm_running', '1');
     log('开始监控，轮询间隔 ' + cfg.pollSec + ' 秒', 'ok');
+    log('后台防护：' + (WT.ok() ? 'Worker 定时器已启用（切到后台也不会被拖慢）' : 'Worker 不可用，退回普通定时器'), 'muted');
     renderStatus();
     loop();
     syncClock().then(function () { armSnipe(); });
@@ -859,8 +866,8 @@
   function stop(reason) {
     S.running = false;
     store.set('ssm_running', '0');
-    if (S.timer) { clearTimeout(S.timer); S.timer = null; }
-    if (snipeTimer) { clearTimeout(snipeTimer); snipeTimer = null; }
+    if (S.timer) { WT.clear(S.timer); S.timer = null; }
+    if (snipeTimer) { WT.clear(snipeTimer); snipeTimer = null; }
     S.snipeAt = 0;
     keepAliveAudio(false);
     if (reason) log('已停止（' + reason + '）', 'warn');
@@ -872,8 +879,22 @@
     await tick();
     if (!S.running) return;
     const ms = Math.max(20, cfg.pollSec) * 1000 * rnd(0.85, 1.15);
-    S.timer = setTimeout(loop, ms);
+    S.timer = WT.set(ms, loop);
   }
+
+  // 从后台切回前台时补一次：被节流那段时间可能错过了好几轮
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) return;
+    if (keepAlive && keepAlive.ctx && keepAlive.ctx.state === 'suspended') {
+      try { keepAlive.ctx.resume(); } catch (e) { }
+    }
+    if (S.running && S.lastTickAt && Date.now() - S.lastTickAt > Math.max(20, cfg.pollSec) * 2000) {
+      const gap = Math.round((Date.now() - S.lastTickAt) / 1000);
+      log('标签页回到前台，上次检查已是 ' + gap + ' 秒前，立即补查一次', 'muted');
+      if (S.timer) { WT.clear(S.timer); S.timer = null; }
+      loop();
+    }
+  });
 
   // 抢放号倒计时：每秒刷新一次状态行
   setInterval(() => {
@@ -897,6 +918,47 @@
   let snipeTimer = null;  // 武装用的定时器
   let sniping = false;
   let keepAlive = null;
+
+  /* ======================= 后台标签页的定时器 =======================
+     浏览器会把隐藏标签页的定时器夹到 1 秒；隐藏满 5 分钟后再"密集节流"到
+     1 分钟一次。专用 Worker 里的定时器不吃这条约束，所以关键定时器搬进去。
+     blob worker 可能被页面 CSP 拦掉，那就自动退回普通 setTimeout。        */
+  const WT = (function () {
+    let wk = null, tried = false, seq = 0;
+    const pend = new Map();
+    function ensure() {
+      if (wk || tried) return wk;
+      tried = true;
+      try {
+        const src = 'var T={};onmessage=function(e){var d=e.data;' +
+          'if(d.t==="set"){T[d.id]=setTimeout(function(){delete T[d.id];' +
+          'postMessage({t:"fire",id:d.id})},d.ms)}' +
+          'else if(d.t==="clear"){clearTimeout(T[d.id]);delete T[d.id]}}';
+        const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+        wk = new Worker(url);
+        wk.onmessage = function (e) {
+          const f = pend.get(e.data.id);
+          if (f) { pend.delete(e.data.id); try { f(); } catch (err) { } }
+        };
+      } catch (e) { wk = null; }
+      return wk;
+    }
+    return {
+      ok: function () { return !!ensure(); },
+      set: function (ms, fn) {
+        const w = ensure();
+        const id = ++seq;
+        pend.set(id, fn);
+        if (w) { w.postMessage({ t: 'set', id: id, ms: ms }); return { wid: id }; }
+        return { tid: setTimeout(function () { pend.delete(id); fn(); }, ms) };
+      },
+      clear: function (h) {
+        if (!h) return;
+        if (h.tid) { clearTimeout(h.tid); return; }
+        if (h.wid) { pend.delete(h.wid); if (wk) wk.postMessage({ t: 'clear', id: h.wid }); }
+      }
+    };
+  })();
 
   function serverNow() { return Date.now() + srvOffset; }
 
@@ -935,8 +997,8 @@
     return at;
   }
 
-  // 后台标签页的定时器会被拖慢到 1 分钟一次。播放音频的标签页不受节流，
-  // 所以临开抢前放一个几乎无声的音，把标签页"点亮"。
+  // 后台标签页的定时器会被拖慢到 1 分钟一次。播放音频的标签页不算"隐藏"，
+  // 不会被密集节流，所以放一个几乎无声的音把标签页"点亮"。
   function keepAliveAudio(on) {
     try {
       if (on) {
@@ -949,6 +1011,16 @@
         osc.connect(g); g.connect(ctx.destination);
         osc.start();
         keepAlive = { ctx: ctx, osc: osc };
+        if (ctx.state === 'suspended') {
+          // 没有用户手势时浏览器不让出声，尝试救一次；救不回来也不至于崩
+          const p = ctx.resume();
+          if (p && p.catch) p.catch(function () { });
+          setTimeout(function () {
+            if (keepAlive && keepAlive.ctx === ctx && ctx.state === 'suspended') {
+              log('保活音频被浏览器挂起：后台定时器可能被节流，在页面上点一下「停止」再「开始监控」可恢复', 'warn');
+            }
+          }, 600);
+        }
         log('已开启保活音频，防止后台节流拖慢定时器', 'muted');
       } else if (keepAlive) {
         try { keepAlive.osc.stop(); keepAlive.ctx.close(); } catch (e) { }
@@ -958,18 +1030,18 @@
   }
 
   function armSnipe() {
-    if (snipeTimer) { clearTimeout(snipeTimer); snipeTimer = null; }
+    if (snipeTimer) { WT.clear(snipeTimer); snipeTimer = null; }
     S.snipeAt = 0;
     if (!S.running || !cfg.snipe.enabled || !cfg.targets.length) { keepAliveAudio(false); renderStatus(); return; }
 
     const at = nextReleaseAt();
     S.snipeAt = at;
     const wait = at - cfg.snipe.leadMs - Date.now();
-    if (wait <= 0) { setTimeout(onSnipeFire, 60); return; }
+    if (wait <= 0) { WT.set(60, onSnipeFire); return; }
 
-    snipeTimer = setTimeout(onSnipeFire, wait);
+    snipeTimer = WT.set(wait, onSnipeFire);
     if (wait < 130000) keepAliveAudio(true);
-    else setTimeout(function () { if (S.running && cfg.snipe.enabled) keepAliveAudio(true); }, wait - 120000);
+    else WT.set(wait - 120000, function () { if (S.running && cfg.snipe.enabled) keepAliveAudio(true); });
 
     log('已武装 12:00 抢放号：' + new Date(at).toLocaleString('zh-CN'), 'ok');
     renderStatus();
